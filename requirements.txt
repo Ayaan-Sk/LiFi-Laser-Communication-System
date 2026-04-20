@@ -1,0 +1,7 @@
+numpy
+scipy
+sounddevice
+pycryptodome
+pyttsx3
+matplotlib
+pyserial
