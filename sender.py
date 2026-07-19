@@ -104,7 +104,8 @@ class LiFiSenderApp:
         if not cipher: return
 
         self.status_var.set("Status: Encrypting...")
-        encrypted_data = cipher.encrypt(data_bytes)
+        lenght_header = len(data_bytes).to_bytes(4, byteorder='big')
+        encrypted_data = cipher.encrypt(lenght_header + data_bytes)
         
         self.status_var.set("Status: Modulating...")
         bits = bytes_to_bits(encrypted_data)
@@ -170,4 +171,5 @@ class LiFiSenderApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = LiFiSenderApp(root)
+    
     root.mainloop()

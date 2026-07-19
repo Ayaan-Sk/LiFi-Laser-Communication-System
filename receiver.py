@@ -113,20 +113,41 @@ class LiFiReceiverApp:
             cipher = AESCipher(self.key_entry.get())
             decrypted_bytes = cipher.decrypt(encrypted_bytes)
             
+            # The sender prepends a 4-byte length header. We must extract it.
+            if len(decrypted_bytes) >= 4:
+                payload_len = int.from_bytes(decrypted_bytes[:4], byteorder='big')
+                if 0 <= payload_len <= len(decrypted_bytes) - 4:
+                    actual_payload = decrypted_bytes[4:4+payload_len]
+                else:
+                    actual_payload = decrypted_bytes[4:]
+            else:
+                actual_payload = decrypted_bytes
+            
             # Try to interpret as text
             try:
-                text = decrypted_bytes.decode('utf-8')
-                self.root.after(0, self.display_text, f"[Text]: {text}\n")
-            except:
+                # Use errors='replace' to see whatever characters we can decode even if there are errors,
+                # but first try a clean decode so we can report if it was perfectly clean or had errors.
+                clean_text = actual_payload.decode('utf-8')
+                self.root.after(0, self.display_text, f"[Text]: {clean_text}\n")
+            except Exception as decode_err:
+                # If clean decode fails, show a preview with replacement characters and debug info
+                decoded_with_errors = actual_payload.decode('utf-8', errors='replace')
+                debug_info = (
+                    f"[Decode Fail] Demodulated bits count: {len(bits)}\n"
+                    f"[Decode Fail] Decrypted bytes (len={len(actual_payload)}): {actual_payload.hex()}\n"
+                    f"[Decode Fail] Decoded (with replacement): {decoded_with_errors}\n"
+                    f"[Decode Fail] Error: {decode_err}\n\n"
+                )
+                self.root.after(0, self.display_text, debug_info)
+                
                 # If not text, maybe audio?
-                self.root.after(0, self.display_text, f"[Binary]: {len(decrypted_bytes)} bytes received.\n")
-                # Try playing it if it's likely audio samples
-                if b'WAVE' in decrypted_bytes[:20] or len(decrypted_bytes) > 100:
-                    threading.Thread(target=self.play_received_audio, args=(decrypted_bytes,), daemon=True).start()
+                if b'WAVE' in actual_payload[:20] or len(actual_payload) > 100:
+                    threading.Thread(target=self.play_received_audio, args=(actual_payload,), daemon=True).start()
 
             self.status_var.set("Status: Listening...")
         except Exception as e:
-            print(f"Error in processing: {e}")
+            import traceback
+            traceback.print_exc()
             self.status_var.set("Status: Decode Error")
 
     def display_text(self, text):

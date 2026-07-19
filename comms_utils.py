@@ -96,18 +96,23 @@ class LiFiDemodulator:
         lp_b, lp_a = signal.butter(4, (self.baud * 2) / nyq, btype='low')
         envelope = signal.filtfilt(lp_b, lp_a, rectified)
         
-        # 3. Dynamic Thresholding
-        threshold = np.max(envelope) * 0.5
+        # 3. Dynamic Thresholding using 98th percentile to avoid pop/click noise spikes
+        threshold = np.percentile(envelope, 98) * 0.5
         binary_envelope = (envelope > threshold).astype(int)
         
         # 4. Synchronization and Sampling
         # This is the tricky part: find the sync word
-        # We'll use cross-correlation or simple sliding window
+        # We'll use polar cross-correlation (mapping 0 -> -1 and 1 -> 1)
+        # to ensure that mismatches (e.g. 1 where a 0 is expected) are penalized.
         sync_bits = np.array(self.sync_word)
         sync_samples = np.repeat(sync_bits, self.samples_per_bit)
         
+        # Convert binary 0/1 to polar -1/1
+        binary_envelope_polar = 2 * binary_envelope - 1
+        sync_samples_polar = 2 * sync_samples - 1
+        
         # Cross correlate to find sync word position
-        correlation = np.correlate(binary_envelope, sync_samples, mode='valid')
+        correlation = np.correlate(binary_envelope_polar, sync_samples_polar, mode='valid')
         sync_start = np.argmax(correlation)
         
         # Start sampling bits after the sync word
