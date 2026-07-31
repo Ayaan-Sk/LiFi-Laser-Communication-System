@@ -15,7 +15,7 @@ class LiFiReceiverApp:
         self.root.geometry("800x800")
         self.root.configure(bg="#2c3e50")
 
-        self.demodulator = LiFiDemodulator(baud_rate=100)
+        self.demodulator = LiFiDemodulator(baud_rate=100, carrier_freq=5000)
         self.audio_queue = queue.Queue()
         self.is_listening = False
         
@@ -31,9 +31,15 @@ class LiFiReceiverApp:
         settings_frame.pack(fill="x", padx=20, pady=5)
 
         tk.Label(settings_frame, text="AES Decryption Key:", fg="#ecf0f1", bg="#2c3e50").grid(row=0, column=0, sticky="w")
-        self.key_entry = tk.Entry(settings_frame, width=30, show="*")
+        self.key_entry = tk.Entry(settings_frame, width=30)
         self.key_entry.insert(0, "default_secret_k")
         self.key_entry.grid(row=0, column=1, padx=10)
+
+        tk.Label(settings_frame, text="Gemini API Key (Optional):", fg="#ecf0f1", bg="#2c3e50").grid(row=1, column=0, sticky="w", pady=5)
+        self.ai_key_entry = tk.Entry(settings_frame, width=30, show="*")
+        import os
+        self.ai_key_entry.insert(0, os.environ.get("GEMINI_API_KEY", ""))
+        self.ai_key_entry.grid(row=1, column=1, padx=10, pady=5)
 
         # Controls
         ctrl_frame = tk.Frame(self.root, bg="#2c3e50")
@@ -77,11 +83,10 @@ class LiFiReceiverApp:
             self.status_var.set("Status: Stopped")
 
     def listening_thread(self):
-        duration = 10 # Buffer size in seconds
+        duration = 5 # 5-second buffer size for fast responsive audio processing
         fs = 44100
         
         while self.is_listening:
-            # Record a chunk
             recording = sd.rec(int(duration * fs), samplerate=fs, channels=1)
             sd.wait()
             
@@ -91,7 +96,6 @@ class LiFiReceiverApp:
 
     def update_viz(self, audio_data):
         self.ax.clear()
-        # Show a slice of the input
         self.ax.plot(audio_data[:2000], color='#f1c40f')
         self.ax.set_facecolor('#34495e')
         self.ax.tick_params(colors='white')
@@ -104,16 +108,16 @@ class LiFiReceiverApp:
         try:
             bits = self.demodulator.demodulate(audio_data)
             if not bits or len(bits) < 8:
-                self.status_var.set("Status: Listening (No data found)")
+                self.status_var.set("Status: Listening...")
                 return
 
             self.status_var.set("Status: Decrypting...")
             encrypted_bytes = bits_to_bytes(bits)
             
-            cipher = AESCipher(self.key_entry.get())
+            key = self.key_entry.get().strip() or "default_secret_k"
+            cipher = AESCipher(key)
             decrypted_bytes = cipher.decrypt(encrypted_bytes)
             
-            # The sender prepends a 4-byte length header. We must extract it.
             if len(decrypted_bytes) >= 4:
                 payload_len = int.from_bytes(decrypted_bytes[:4], byteorder='big')
                 if 0 <= payload_len <= len(decrypted_bytes) - 4:
@@ -123,40 +127,50 @@ class LiFiReceiverApp:
             else:
                 actual_payload = decrypted_bytes
             
-            # Try to interpret as text
             try:
-                # Use errors='replace' to see whatever characters we can decode even if there are errors,
-                # but first try a clean decode so we can report if it was perfectly clean or had errors.
                 clean_text = actual_payload.decode('utf-8')
                 self.root.after(0, self.display_text, f"[Text]: {clean_text}\n")
             except Exception as decode_err:
-                # If clean decode fails, show a preview with replacement characters and debug info
                 decoded_with_errors = actual_payload.decode('utf-8', errors='replace')
-                debug_info = (
-                    f"[Decode Fail] Demodulated bits count: {len(bits)}\n"
-                    f"[Decode Fail] Decrypted bytes (len={len(actual_payload)}): {actual_payload.hex()}\n"
-                    f"[Decode Fail] Decoded (with replacement): {decoded_with_errors}\n"
-                    f"[Decode Fail] Error: {decode_err}\n\n"
-                )
-                self.root.after(0, self.display_text, debug_info)
-                
-                # If not text, maybe audio?
-                if b'WAVE' in actual_payload[:20] or len(actual_payload) > 100:
-                    threading.Thread(target=self.play_received_audio, args=(actual_payload,), daemon=True).start()
+                self.root.after(0, self.display_text, f"[Decrypted Text]: {decoded_with_errors}\n")
+                self.try_ai_repair(actual_payload, decoded_with_errors)
 
             self.status_var.set("Status: Listening...")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             self.status_var.set("Status: Decode Error")
+
+    def try_ai_repair(self, actual_payload, decoded_with_errors):
+        api_key = self.ai_key_entry.get().strip()
+        if not api_key:
+            return
+            
+        def run_ai():
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                
+                prompt = (
+                    "You are assisting a Li-Fi communication system receiver. "
+                    "Reconstruct the original intended plaintext message based on the following information.\n\n"
+                    f"Partially decoded text: \"{decoded_with_errors}\"\n"
+                    f"Raw decrypted payload bytes (hex): \"{actual_payload.hex()}\"\n\n"
+                    "Output ONLY the corrected plaintext message without code blocks or extra formatting."
+                )
+                
+                response = model.generate_content(prompt)
+                reconstructed = response.text.strip()
+                self.root.after(0, self.display_text, f"[AI Reconstructed]: {reconstructed}\n\n")
+            except Exception as ai_err:
+                self.root.after(0, self.display_text, f"[AI Repair Error]: {str(ai_err)}\n\n")
+                
+        threading.Thread(target=run_ai, daemon=True).start()
 
     def display_text(self, text):
         self.text_output.insert(tk.END, text)
         self.text_output.see(tk.END)
 
     def play_received_audio(self, data):
-        # Very basic check: if it looks like raw PCM (from our 8kHz mic test)
-        # We'd need a header or a fixed format to be robust
         try:
             audio_array = np.frombuffer(data, dtype='int16')
             sd.play(audio_array, samplerate=8000)

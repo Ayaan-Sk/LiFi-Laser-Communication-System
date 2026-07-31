@@ -15,12 +15,12 @@ from comms_utils import AESCipher, LiFiModulator, bytes_to_bits
 class LiFiSenderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Li-Fi Transmitter (Sender)")
+        self.root.title("Li-Fi Digital Audio Transmitter (Sender)")
         self.root.geometry("800x800")
         self.root.configure(bg="#2c3e50")
 
         self.cipher = None
-        self.modulator = LiFiModulator(baud_rate=100) # Default slow and steady
+        self.modulator = LiFiModulator(baud_rate=100, carrier_freq=5000) # Fast & Loud
         self.is_transmitting = False
 
         self.setup_ui()
@@ -35,12 +35,12 @@ class LiFiSenderApp:
         settings_frame.pack(fill="x", padx=20, pady=5)
 
         tk.Label(settings_frame, text="AES Encryption Key (16 chars):", fg="#ecf0f1", bg="#2c3e50").grid(row=0, column=0, sticky="w")
-        self.key_entry = tk.Entry(settings_frame, width=30, show="*")
+        self.key_entry = tk.Entry(settings_frame, width=30)
         self.key_entry.insert(0, "default_secret_k")
         self.key_entry.grid(row=0, column=1, padx=10)
 
         # Serial Frame
-        serial_frame = tk.LabelFrame(settings_frame, text="Serial Output (Arduino)", fg="#ecf0f1", bg="#2c3e50")
+        serial_frame = tk.LabelFrame(settings_frame, text="Serial Output (Arduino / Laser Driver)", fg="#ecf0f1", bg="#2c3e50")
         serial_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=5)
         
         tk.Label(serial_frame, text="COM Port:", fg="#ecf0f1", bg="#2c3e50").grid(row=0, column=0)
@@ -52,7 +52,7 @@ class LiFiSenderApp:
         tk.Checkbutton(serial_frame, text="Enable Serial Output", variable=self.use_serial, bg="#2c3e50", fg="#ecf0f1", selectcolor="#34495e").grid(row=0, column=2, padx=10)
 
         # Input Frame
-        input_frame = tk.LabelFrame(self.root, text="Audio/Text Input", fg="#ecf0f1", bg="#2c3e50", padx=10, pady=10)
+        input_frame = tk.LabelFrame(self.root, text="Audio / Text Input", fg="#ecf0f1", bg="#2c3e50", padx=10, pady=10)
         input_frame.pack(fill="both", expand=True, padx=20, pady=5)
 
         # Text mode
@@ -86,22 +86,18 @@ class LiFiSenderApp:
 
     def update_viz(self, signal):
         self.ax.clear()
-        self.ax.plot(signal[:5000], color='#2ecc71') # Show first 5000 samples
+        self.ax.plot(signal[:5000], color='#2ecc71')
         self.ax.set_title("OOK Modulated Waveform (First 5000 samples)", color='white')
         self.ax.set_facecolor('#34495e')
         self.ax.tick_params(colors='white')
         self.canvas.draw()
 
     def get_cipher(self):
-        key = self.key_entry.get()
-        if not key:
-            messagebox.showerror("Error", "Please enter an AES key.")
-            return None
+        key = self.key_entry.get().strip() or "default_secret_k"
         return AESCipher(key)
 
     def process_and_transmit(self, data_bytes):
         cipher = self.get_cipher()
-        if not cipher: return
 
         self.status_var.set("Status: Encrypting...")
         lenght_header = len(data_bytes).to_bytes(4, byteorder='big')
@@ -131,7 +127,7 @@ class LiFiSenderApp:
             except Exception as e:
                 messagebox.showerror("Serial Error", str(e))
 
-        # Play audio
+        # Play audio waveform
         sd.play(waveform, samplerate=44100)
         sd.wait()
         self.status_var.set("Status: Transmission Complete")
@@ -141,14 +137,13 @@ class LiFiSenderApp:
         if not text:
             messagebox.showwarning("Warning", "Text is empty!")
             return
-        threading.Thread(target=self.process_and_transmit, args=(text.encode(),), daemon=True).start()
+        threading.Thread(target=self.process_and_transmit, args=(text.encode('utf-8'),), daemon=True).start()
 
     def load_wav(self):
         path = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav")])
         if path:
             with open(path, 'rb') as f:
                 data = f.read()
-                # Audio files can be large, we might want to warn the user
                 if len(data) > 10000:
                     if not messagebox.askyesno("Large File", "This file is large and will take a long time to transmit. Continue?"):
                         return
@@ -156,7 +151,7 @@ class LiFiSenderApp:
 
     def record_mic(self):
         duration = 5  # seconds
-        fs = 8000     # Low sample rate for Li-Fi transmission feasibility
+        fs = 8000     # Sample rate
         self.status_var.set("Status: Recording...")
         
         def do_rec():
@@ -171,5 +166,4 @@ class LiFiSenderApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = LiFiSenderApp(root)
-    
     root.mainloop()

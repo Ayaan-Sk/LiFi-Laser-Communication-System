@@ -2,16 +2,19 @@ import numpy as np
 from scipy import signal
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
-import base64
+import hashlib
 
 class AESCipher:
     """Handles AES encryption and decryption using CTR mode."""
-    def __init__(self, key: str):
-        # AES-256 requires 32 bytes. We'll pad or truncate the user key.
-        self.key = key.encode('utf-8').ljust(32, b'\0')[:32]
+    def __init__(self, key: str = "default_secret_k"):
+        if not key or not str(key).strip():
+            key_str = "default_secret_k"
+        else:
+            key_str = str(key).strip()
+        key_bytes = key_str.encode('utf-8')
+        self.key = hashlib.sha256(key_bytes).digest()
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        # Use CTR mode for arbitrary length data without padding issues
         ctr = Counter.new(128)
         cipher = AES.new(self.key, AES.MODE_CTR, counter=ctr)
         return cipher.encrypt(plaintext)
@@ -33,18 +36,17 @@ def bits_to_bytes(bits: list) -> bytes:
     """Converts a list of bits (integers) back to bytes."""
     byte_list = []
     for i in range(0, len(bits), 8):
-        byte = 0
         chunk = bits[i:i+8]
         if len(chunk) < 8:
-            # Pad with zeros if bits don't align to byte boundary
             chunk = chunk + [0] * (8 - len(chunk))
+        byte = 0
         for bit in chunk:
-            byte = (byte << 1) | bit
+            byte = (byte << 1) | int(bit)
         byte_list.append(byte)
     return bytes(byte_list)
 
 class LiFiModulator:
-    """Handles OOK modulation with a carrier frequency."""
+    """Handles fast OOK modulation with a 5kHz carrier frequency."""
     def __init__(self, sample_rate=44100, baud_rate=100, carrier_freq=5000):
         self.fs = sample_rate
         self.baud = baud_rate
@@ -61,68 +63,86 @@ class LiFiModulator:
         full_payload = self.preamble + self.sync_word + bits
         t = np.linspace(0, len(full_payload) * (1/self.baud), len(full_payload) * self.samples_per_bit, endpoint=False)
         
-        # Generate carrier signal
         carrier = np.sin(2 * np.pi * self.carrier_freq * t)
-        
-        # Create modulation mask (1 for '1', 0 for '0')
         mask = np.repeat(full_payload, self.samples_per_bit)
         
-        # Ensure mask and carrier match in length
         min_len = min(len(carrier), len(mask))
         return (carrier[:min_len] * mask[:min_len]).astype(np.float32)
 
 class LiFiDemodulator:
-    """Handles OOK demodulation and synchronization."""
+    """Handles fast OOK demodulation and synchronization."""
     def __init__(self, sample_rate=44100, baud_rate=100, carrier_freq=5000):
         self.fs = sample_rate
         self.baud = baud_rate
         self.carrier_freq = carrier_freq
         self.samples_per_bit = int(self.fs / self.baud)
         
+        self.preamble = [1, 0] * 8
         self.sync_word = [0, 1, 1, 1, 1, 1, 1, 0]
 
     def demodulate(self, audio_data: np.ndarray) -> list:
         """Extracts bits from an audio waveform."""
-        # 1. Bandpass filter around carrier frequency
+        if len(audio_data) < self.samples_per_bit * 24:
+            return []
+            
         nyq = 0.5 * self.fs
         low = (self.carrier_freq - 500) / nyq
         high = (self.carrier_freq + 500) / nyq
         b, a = signal.butter(4, [low, high], btype='band')
         filtered = signal.filtfilt(b, a, audio_data)
         
-        # 2. Envelope detection (Rectification + Lowpass)
         rectified = np.abs(filtered)
-        # Lowpass filter to smooth the envelope (cutoff at 2 * baud)
         lp_b, lp_a = signal.butter(4, (self.baud * 2) / nyq, btype='low')
         envelope = signal.filtfilt(lp_b, lp_a, rectified)
         
-        # 3. Dynamic Thresholding using 98th percentile to avoid pop/click noise spikes
         threshold = np.percentile(envelope, 98) * 0.5
+        if threshold < 1e-4:
+            return []
         binary_envelope = (envelope > threshold).astype(int)
         
-        # 4. Synchronization and Sampling
-        # This is the tricky part: find the sync word
-        # We'll use polar cross-correlation (mapping 0 -> -1 and 1 -> 1)
-        # to ensure that mismatches (e.g. 1 where a 0 is expected) are penalized.
-        sync_bits = np.array(self.sync_word)
+        sync_bits = np.array(self.preamble + self.sync_word)
         sync_samples = np.repeat(sync_bits, self.samples_per_bit)
         
-        # Convert binary 0/1 to polar -1/1
         binary_envelope_polar = 2 * binary_envelope - 1
         sync_samples_polar = 2 * sync_samples - 1
         
-        # Cross correlate to find sync word position
-        correlation = np.correlate(binary_envelope_polar, sync_samples_polar, mode='valid')
-        sync_start = np.argmax(correlation)
+        correlation = signal.correlate(binary_envelope_polar, sync_samples_polar, mode='valid', method='fft')
         
-        # Start sampling bits after the sync word
-        payload_start = sync_start + (len(self.sync_word) * self.samples_per_bit)
+        max_possible_corr = len(sync_bits) * self.samples_per_bit
+        if len(correlation) == 0 or np.max(correlation) < 0.65 * max_possible_corr:
+            return []
+            
+        sync_start = np.argmax(correlation)
+        payload_start = sync_start + (len(sync_bits) * self.samples_per_bit)
         
         decoded_bits = []
-        for i in range(payload_start, len(binary_envelope) - self.samples_per_bit, self.samples_per_bit):
-            # Sample in the middle of the bit period
-            sample_point = i + (self.samples_per_bit // 2)
-            if sample_point < len(binary_envelope):
-                decoded_bits.append(binary_envelope[sample_point])
+        current_idx = payload_start
+        search_half_window = max(1, self.samples_per_bit // 4)
+        
+        while current_idx + self.samples_per_bit <= len(binary_envelope):
+            center_idx = int(current_idx + self.samples_per_bit / 2)
+            if center_idx >= len(binary_envelope):
+                break
+            decoded_bits.append(int(binary_envelope[center_idx]))
+            
+            nominal_boundary = current_idx + self.samples_per_bit
+            search_start = max(1, nominal_boundary - search_half_window)
+            search_end = min(len(binary_envelope), nominal_boundary + search_half_window + 1)
+            
+            edge_found_idx = None
+            min_dist = float('inf')
+            
+            for j in range(search_start, search_end):
+                if binary_envelope[j] != binary_envelope[j-1]:
+                    dist = abs(j - nominal_boundary)
+                    if dist < min_dist:
+                        min_dist = dist
+                        edge_found_idx = j
+            
+            if edge_found_idx is not None:
+                error = edge_found_idx - nominal_boundary
+                current_idx = nominal_boundary + int(0.1 * error)
+            else:
+                current_idx = nominal_boundary
         
         return decoded_bits

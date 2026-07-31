@@ -5,3 +5,4 @@ pycryptodome
 pyttsx3
 matplotlib
 pyserial
+google-generativeai
